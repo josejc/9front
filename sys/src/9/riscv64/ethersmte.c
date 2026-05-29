@@ -191,7 +191,6 @@ struct Ctlr {
 	void	*regs;		/* MAC/DMA MMIO */
 	void	*apmu;		/* APMU MMIO */
 	u32int	apmuoff;
-	int	irq;
 	int attach;
 
 	u32int	rxdelay;
@@ -238,20 +237,12 @@ ethtx(Ether *edev)
 
 }
 
-static void
-ethirq(Ureg *, void *arg)
-{
-
-}
-
 static int
 ethinit(Ether *edev)
 {
 
 	return 0;
 }
-
-
 
 static void
 ethprom(void *arg, int on)
@@ -396,14 +387,13 @@ etherpnp(Ether *edev)
 {
 	static Ctlr ct;
 
-	if(ct.irq != 0)		// The first time pass
+	if(ct.regs != nil)		// The first time pass
 		return -1;
 
 	if (check_soc_fingerprint()) {
 		ct.regs 	= vmap(EMAC0_PHYS, EMAC0_SIZE);
 		ct.apmu 	= vmap(APMU_PHYS, APMU_SIZE);
 		ct.apmuoff 	= EMAC0_APMU_OFF;
-		ct.irq     	= EMAC0_IRQ;
 		ct.rxdelay 	= SMTE_DEFAULT_RXDELAY_PS;
 		ct.txdelay 	= SMTE_DEFAULT_TXDELAY_PS;
 	
