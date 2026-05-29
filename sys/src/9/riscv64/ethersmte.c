@@ -7,12 +7,13 @@
 #include "../port/netif.h"
 #include "../port/etherif.h"
 
+#define Rbsz ROUNDUP(sizeof(Etherpkt)+16, 64)
+
 /* Physical address and IRQ */
 enum {
 	EMAC0_PHYS		= 0xcac80000UL,
 	EMAC0_SIZE		= 0x420,
 	EMAC0_IRQ		= 141, 
-	EMAC0_APMU_OFF	= 0x0000,
 
 	APMU_PHYS		= 0xd4282800UL,
 	APMU_SIZE		= 0x400,
@@ -134,16 +135,6 @@ enum {
 	APMU_EMAC_RGMII_DLINE_RX_EN		= (1U << 0),
 };
 
-/* Descriptors */
-typedef struct SmteDesc SmteDesc;
-
-struct SmteDesc {
-	u32int	sd_desc0;
-	u32int	sd_desc1;
-	u32int	sd_addr1;
-	u32int	sd_addr2;
-};
-
 /* Rx bits */
 enum {
 	RX_DESC0_FRAME_PACKET_LENGTH_MASK	= (0x3fff << 0),
@@ -178,6 +169,12 @@ enum {
 	TX_DESC1_INTERRUPT_ON_COMPLETION	= (1U << 31),
 };
 
+enum {
+	Linkdelay	= 500,
+	RXRING		= 512,
+	TXRING		= 512,
+};
+
 /* SDH data for check Vendor_ID Spacemit Soc */
 enum {
 	SDH1_PHYS		= 0xD4280000,
@@ -188,10 +185,14 @@ enum {
 typedef struct Ctlr Ctlr;
 
 struct Ctlr {
-	void	*regs;		/* MAC/DMA MMIO */
-	void	*apmu;		/* APMU MMIO */
-	u32int	apmuoff;
+	ulong *regs;		/* MAC/DMA MMIO */
+	ulong *apmu;		/* APMU MMIO */
 	int attach;
+
+	/* Rings RX, TX and indexes */
+	ulong	*rxr, *txr;
+	Block	**rxs, **txs;
+	int	rxprodi, rxconsi, txi;	
 
 	u32int	rxdelay;
 	u32int	txdelay;
@@ -237,19 +238,6 @@ ethtx(Ether *edev)
 
 }
 
-static int
-ethinit(Ether *edev)
-{
-
-	return 0;
-}
-
-static void
-ethprom(void *arg, int on)
-{
-
-}
-
 static void
 sethash(uchar *ea, ulong *hash)
 {
@@ -265,12 +253,6 @@ sethash(uchar *ea, ulong *hash)
 	}
 	n ^= 0xff;
 	hash[n>>5] |= (1<<(n & 31));
-}
-
-static void
-ethmcast(void *arg, uchar *ea, int on)
-{
-
 }
 
 static char*
@@ -339,6 +321,113 @@ ethattach(Ether *edev)
 	//kproc("ethproc", ethproc, edev);
 }
 
+static int
+replenish(Ctlr *c)
+{
+	Block *bp;
+	ulong *r;
+	uintptr pa;
+	int i;
+
+	while(c->rxprodi != c->rxconsi){
+		i = c->rxprodi;
+		bp = iallocb(Rbsz);
+		if(bp == nil){
+			print("smte: out of rx buffers\n");
+			return -1;
+		}
+		c->rxs[i] = bp;
+		r = &c->rxr[4 * i];
+		/* cleandse(start, end)   →  clean (write-back) D-cache
+		* ensures that the DMA reads fresh data 
+		* does not yet exist in riscv64 */
+		//cleandse(bp->base, bp->lim);
+		pa = (uintptr)bp->rp;
+		r[0] = 0;
+		r[1] = Rbsz;
+		if(i == RXRING - 1)
+			r[1] |= 1<<26;		/* end of ring */
+		r[2] = (ulong)pa;
+		r[3] = (ulong)((uvlong)pa >> 32);
+		r[0] = 1<<31;			/* OWN */
+		c->rxprodi = (c->rxprodi + 1) & (RXRING - 1);
+	}
+	c->regs[DMA_RECEIVE_POLL_DEMAND] = 1;
+	return 0;
+}
+
+static int
+ethinit(Ether *edev)
+{
+	Ctlr *c;
+
+	c = edev->ctlr;
+
+	/* APMU: enable AXI master ID and program RGMII delay lines */
+	c->apmu[APMU_EMAC_CLK_RST_CTRL] |= APMU_EMAC_AXI_MST_ID;
+
+	c->apmu[APMU_EMAC_RGMII_DLINE] = APMU_EMAC_RGMII_DLINE_RX_EN | APMU_EMAC_RGMII_DLINE_TX_EN
+		| APMU_EMAC_RGMII_DLINE_RX_STEP_15P6 | APMU_EMAC_RGMII_DLINE_TX_STEP_15P6
+		| c->rxdelay << APMU_EMAC_RGMII_DLINE_RX_DELAY_SHIFT | c->txdelay << APMU_EMAC_RGMII_DLINE_TX_DELAY_SHIFT;
+
+	/* MAC address */
+	c->regs[MAC_ADDR1_HI] = edev->ea[1]<<8 | edev->ea[0];
+	c->regs[MAC_ADDR1_ME] = edev->ea[3]<<8 | edev->ea[2];
+	c->regs[MAC_ADDR1_LO] = edev->ea[5]<<8 | edev->ea[4];
+	c->regs[MAC_ADDR_CTRL] = MAC_ADDR_CTRL_MAC_ADDR1_ENABLE;
+
+	/* MAC Multicast Hash Tables 
+	c->regs[MAC_MULTICAST_HASH_TABLE1] = c->regs[MAC_MULTICAST_HASH_TABLE2] = 0;
+	c->regs[MAC_MULTICAST_HASH_TABLE3] = c->regs[MAC_MULTICAST_HASH_TABLE4] = 0;
+	*/
+
+	/* FIFO thresholds */
+	c->regs[MAC_TRANSMIT_FIFO_ALMOST_FULL] = 0x1f8;
+	c->regs[MAC_TRANSMIT_PACKET_START_THRESHOLD] = 1518;
+	c->regs[MAC_RECEIVE_PACKET_START_THRESHOLD] = 12;
+	c->regs[MAC_MAXIMUM_FRAME_SIZE] = 1514;
+	c->regs[MAC_TRANSMIT_JABBER_SIZE] = 1514 + 18;
+	c->regs[MAC_RECEIVE_JABBER_SIZE] = 1514 + 18;
+
+	/* RX interrupt coalescing */
+	c->regs[DMA_RECEIVE_IRQ_MITIGATION] = (64<<0) | ((600*312)<<8) | 1<<31;
+
+	/* Reset DMA */
+	c->regs[DMA_CONFIG] = DMA_CONFIG_SOFTWARE_RESET;
+	microdelay(10000);
+	c->regs[DMA_CONFIG] = 0;
+	microdelay(10000);
+	c->regs[DMA_CONFIG] = DMA_CONFIG_DMA_64BIT_MODE | DMA_CONFIG_STRICT_BURST | DMA_CONFIG_BURST_LENGTH_16;
+
+	/* Allocate descriptor rings */
+	c->rxr = mallocalign(4 * sizeof(ulong) * RXRING, BY2PG, 0, 0);
+	c->txr = mallocalign(4 * sizeof(ulong) * TXRING, BY2PG, 0, 0);
+	//c->rxr = ucalloc(16 * RXRING);
+	//c->txr = ucalloc(16 * TXRING);
+
+	c->rxs = xspanalloc(sizeof(Block*) * RXRING, 4, 0);
+	c->txs = xspanalloc(sizeof(Block*) * TXRING, 4, 0);
+	memset(c->rxr, 0, 16 * RXRING);
+	memset(c->txr, 0, 16 * TXRING);
+
+	/* Fill RX ring using the rxconsi=1 trick from ethercycv */
+	c->rxconsi = 1;
+	replenish(c);
+	c->rxconsi = 0;
+	replenish(c);
+
+	c->regs[DMA_RECEIVE_BASE_ADDRESS] = (ulong)c->rxr;
+	c->regs[DMA_TRANSMIT_BASE_ADDRESS] = (ulong)c->txr;
+
+	c->regs[DMA_STATUS_IRQ] = ~0;
+	c->regs[MAC_INTR_ENABLE] = 0;
+	c->regs[DMA_INTR_ENABLE] = 1<<7 | 1<<6 | 1<<5 | 1<<4 | 1<<0; /* rx+tx done */
+
+	c->regs[DMA_CTRL] = DMA_CTRL_START_STOP_TX_DMA | DMA_CTRL_START_STOP_RX_DMA;
+
+	return 0;
+}
+
 static void
 smtereadhwaddr(uintptr base, uchar ea[Eaddrlen])
 {
@@ -391,9 +480,8 @@ etherpnp(Ether *edev)
 		return -1;
 
 	if (check_soc_fingerprint()) {
-		ct.regs 	= vmap(EMAC0_PHYS, EMAC0_SIZE);
-		ct.apmu 	= vmap(APMU_PHYS, APMU_SIZE);
-		ct.apmuoff 	= EMAC0_APMU_OFF;
+		ct.regs 	= (ulong *)vmap(EMAC0_PHYS, EMAC0_SIZE);
+		ct.apmu 	= (ulong *)vmap(APMU_PHYS, APMU_SIZE);
 		ct.rxdelay 	= SMTE_DEFAULT_RXDELAY_PS;
 		ct.txdelay 	= SMTE_DEFAULT_TXDELAY_PS;
 	
@@ -405,7 +493,12 @@ etherpnp(Ether *edev)
 		edev->arg 		= edev;
 		edev->mbps 		= 1000;
 		smtereadhwaddr((uintptr)ct.regs, edev->ea);
-	
+
+		if(ethinit(edev) < 0){
+			edev->ctlr = nil;
+			return -1;
+		}
+
 		//intrenable(edev->irq, ethirq, edev, LEVEL, edev->name);
 		//or
 		//intrenable(edev->irq, ethirq, edev, BUSUNKNOWN, edev->name);
