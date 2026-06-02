@@ -1,4 +1,4 @@
-#include "u.h"
+ #include "u.h"
 #include "tos.h"
 #include "../port/lib.h"
 #include "mem.h"
@@ -57,6 +57,7 @@ init0(void)
 '#ec/tiltscreen'
 '#ec/vgasize'
 */
+
 		ksetenv("nobootprompt", "tcp", 1);
 		ksetenv("ether0", "type=auto", 1);
 		ksetenv("ip", "dhcp", 1);
