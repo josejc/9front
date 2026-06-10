@@ -7,7 +7,7 @@
 #include <u.h>
 #include <libc.h>
 
-char cons[] = "/dev/cons";
+char cons[] = "/dev/eia0";
 char boot[] = "/boot/boot";
 char dev[] = "/dev";
 char c[] = "#c";
@@ -16,6 +16,7 @@ char e[] = "#e";
 char ec[] = "#ec";
 char p[] = "#p";
 char s[] = "#s";
+char t[] = "#t";
 char σ[] = "#σ";
 char env[] = "/env";
 char fd[] = "/fd";
@@ -28,6 +29,7 @@ startboot(char*, char **argv)
 {
 	char buf[200];	/* keep this fairly large to capture error details */
 
+	bind(t, dev, MAFTER);
 	bind(c, dev, MAFTER);
 	bind(d, fd, MREPL);
 	bind(e, env, MREPL|MCREATE);
